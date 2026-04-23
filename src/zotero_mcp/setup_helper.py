@@ -347,6 +347,14 @@ def save_semantic_search_config(config: dict, semantic_config_path: Path) -> boo
         with open(semantic_config_path, 'w') as f:
             json.dump(full_semantic_config, f, indent=2)
 
+        # Restrict to owner-read-only on Unix (may contain API keys).
+        if sys.platform != "win32":
+            import stat
+            try:
+                os.chmod(semantic_config_path, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass
+
         print(f"Semantic search configuration saved to: {semantic_config_path}")
         return True
 
@@ -449,6 +457,8 @@ def update_claude_config(config_path, zotero_mcp_path, local=True, api_key=None,
 
 def _write_standalone_config(local: bool, api_key: str, library_id: str, library_type: str, semantic_config: dict, no_claude: bool = False) -> Path:
     """Write a central config file used by semantic search and provide client env."""
+    import stat
+
     cfg_dir = Path.home() / ".config" / "zotero-mcp"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = cfg_dir / "config.json"
@@ -485,6 +495,14 @@ def _write_standalone_config(local: bool, api_key: str, library_id: str, library
 
     with open(cfg_path, 'w') as f:
         json.dump(full, f, indent=2)
+
+    # Restrict config to owner-read-only on Unix (contains API keys).
+    if sys.platform != "win32":
+        try:
+            os.chmod(cfg_path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            print("Warning: could not restrict config file permissions. "
+                  "Ensure ~/.config/zotero-mcp/config.json is readable only by you.")
 
     return cfg_path
 

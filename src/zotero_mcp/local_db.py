@@ -227,7 +227,20 @@ class LocalZoteroReader:
         if zotero_path.startswith("storage:"):
             rel = zotero_path.split(":", 1)[1]
             parts = [p for p in rel.split("/") if p]
-            return storage_dir / attachment_key / Path(*parts)
+            # Reject path traversal components
+            if any(p == ".." for p in parts):
+                logger.warning("Rejected storage path with '..' component: %s", zotero_path)
+                return None
+            candidate = storage_dir / attachment_key / Path(*parts) if parts else storage_dir / attachment_key
+            # Verify resolved path stays within storage directory
+            try:
+                resolved = candidate.resolve()
+                if not str(resolved).startswith(str(storage_dir.resolve())):
+                    logger.warning("Attachment path escapes storage dir: %s", candidate)
+                    return None
+            except Exception:
+                return None
+            return candidate
 
         # Linked file as URL: 'file:///path/to/file.pdf'
         if zotero_path.startswith("file://"):
@@ -250,9 +263,22 @@ class LocalZoteroReader:
         if zotero_path.startswith("attachments:"):
             rel = zotero_path.split(":", 1)[1]
             parts = [p for p in rel.split("/") if p]
+            # Reject path traversal components
+            if any(p == ".." for p in parts):
+                logger.warning("Rejected attachments path with '..' component: %s", zotero_path)
+                return None
             base = self._get_base_attachment_path()
             if base and base.exists():
-                return base / Path(*parts)
+                candidate = base / Path(*parts) if parts else base
+                # Verify resolved path stays within attachment base directory
+                try:
+                    resolved = candidate.resolve()
+                    if not str(resolved).startswith(str(base.resolve())):
+                        logger.warning("Attachment path escapes base dir: %s", candidate)
+                        return None
+                except Exception:
+                    return None
+                return candidate
             # Fallback: cannot resolve without base path
             return None
 
@@ -287,6 +313,15 @@ class LocalZoteroReader:
                 maxpages = 10
 
         timeout = self.pdf_timeout or 30
+
+        # Pre-flight: reject non-existent paths, symlinks, and non-files to
+        # minimise the attack surface of the subprocess invocation.
+        try:
+            if not file_path.exists() or not file_path.is_file() or file_path.is_symlink():
+                logger.warning("PDF extraction skipped — invalid path: %s", file_path.name)
+                return ""
+        except Exception:
+            return ""
 
         # Inline pdfminer script — imports ONLY pdfminer, not zotero_mcp,
         # so the child process never triggers FastMCP initialization.

@@ -108,14 +108,23 @@ def _verify_archive_checksum(archive_path: str, url: str) -> bool:
 
 def _safe_extract_tar(archive_path: str, destination: str) -> None:
     """Safely extract tar archives while blocking path traversal/symlinks."""
+    import sys
     dest_real = os.path.realpath(destination)
     with tarfile.open(archive_path, "r:gz") as tar:
+        # Python 3.12+ ships a built-in safe filter that blocks symlinks,
+        # absolute paths, and path traversal without manual iteration.
+        if sys.version_info >= (3, 12):
+            tar.extractall(path=destination, filter="data")
+            return
+        # Fallback for Python 3.10/3.11: manual member validation.
         for member in tar.getmembers():
-            member_path = os.path.realpath(os.path.join(destination, member.name))
-            if not member_path.startswith(dest_real + os.sep) and member_path != dest_real:
-                raise ValueError(f"Unsafe tar member path: {member.name}")
             if member.issym() or member.islnk():
-                raise ValueError(f"Refusing to extract symlink from archive: {member.name}")
+                raise ValueError(f"Refusing to extract symlink/hardlink from archive: {member.name}")
+            member_path = os.path.realpath(os.path.join(destination, member.name))
+            # Allow only paths strictly inside dest_real (not equal, which would
+            # mean the archive root itself — that's handled by extractall).
+            if not member_path.startswith(dest_real + os.sep):
+                raise ValueError(f"Unsafe tar member path: {member.name}")
         tar.extractall(path=destination)
 
 

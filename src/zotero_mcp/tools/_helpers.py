@@ -1,14 +1,65 @@
 """Shared private helpers used across tool modules."""
 
+import ipaddress
 import json
+import logging
 import os
 import re
 import tempfile
+from urllib.parse import urlparse
 
 import requests
 
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SSRF guard
+# ---------------------------------------------------------------------------
+
+_ALLOWED_SCHEMES = {"http", "https"}
+
+# Private / loopback CIDRs that must not be reached via user-influenced URLs.
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+]
+
+
+def _is_private_host(hostname: str) -> bool:
+    """Return True if *hostname* resolves to a private/loopback address."""
+    if hostname.lower() in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return any(addr in net for net in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Not a bare IP — we can't resolve DNS here, but we can block obvious cases.
+        return False
+
+
+def _safe_get(url: str, **kwargs) -> requests.Response:
+    """requests.get wrapper that blocks SSRF vectors.
+
+    Raises ValueError for non-http(s) schemes or private/loopback hosts.
+    All external HTTP calls in this module should use _safe_get instead of
+    requests.get directly.
+    """
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(f"Blocked request with unsafe scheme: {scheme!r}")
+    hostname = parsed.hostname or ""
+    if _is_private_host(hostname):
+        raise ValueError(f"Blocked request to private/loopback host: {hostname!r}")
+    return requests.get(url, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +268,7 @@ def _normalize_arxiv_id(raw):
 def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
     """Download a PDF from a URL and attach it to a Zotero item."""
     try:
-        pdf_resp = requests.get(pdf_url, timeout=30, stream=True)
+        pdf_resp = _safe_get(pdf_url, timeout=30, stream=True)
         pdf_resp.raise_for_status()
 
         content_type = pdf_resp.headers.get("Content-Type", "")
@@ -236,13 +287,26 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
                 ctx.info("Downloaded file too small, likely not a real PDF")
                 return False
 
+            # Validate PDF magic bytes before attaching
+            with open(filepath, "rb") as f:
+                header = f.read(4)
+            if header != b"%PDF":
+                ctx.info("Downloaded file does not appear to be a valid PDF (bad magic bytes)")
+                return False
+
             write_zot.attachment_both(
                 [(filename, filepath)],
                 parentid=item_key,
             )
         return True
+    except ValueError as e:
+        # SSRF guard triggered — log detail internally, generic message to caller
+        logger.warning("PDF download blocked: %s", e)
+        ctx.info("PDF download failed: URL not allowed")
+        return False
     except Exception as e:
-        ctx.info(f"PDF download/attach failed: {e}")
+        logger.debug("PDF download/attach error: %s", e)
+        ctx.info("PDF download/attach failed")
         return False
 
 
@@ -267,7 +331,7 @@ def _attach_pdf_linked_url(write_zot, pdf_url, parent_key, ctx):
 def _try_unpaywall(doi, ctx):
     """Try Unpaywall API for open-access PDF URLs."""
     try:
-        resp = requests.get(
+        resp = _safe_get(
             f"https://api.unpaywall.org/v2/{doi}",
             params={"email": "zotero-mcp@users.noreply.github.com"},
             timeout=10,
@@ -296,7 +360,8 @@ def _try_unpaywall(doi, ctx):
 
         return None
     except Exception as e:
-        ctx.info(f"Unpaywall lookup failed: {e}")
+        logger.debug("Unpaywall lookup error: %s", e)
+        ctx.info("Unpaywall lookup failed")
         return None
 
 
@@ -342,7 +407,7 @@ def _try_arxiv_from_crossref(crossref_metadata, ctx):
 def _try_semantic_scholar(doi, ctx):
     """Try Semantic Scholar API for an open-access PDF URL."""
     try:
-        resp = requests.get(
+        resp = _safe_get(
             f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
             params={"fields": "openAccessPdf"},
             timeout=10,
@@ -358,14 +423,15 @@ def _try_semantic_scholar(doi, ctx):
             return pdf_url
         return None
     except Exception as e:
-        ctx.info(f"Semantic Scholar lookup failed: {e}")
+        logger.debug("Semantic Scholar lookup error: %s", e)
+        ctx.info("Semantic Scholar lookup failed")
         return None
 
 
 def _try_pmc(doi, ctx):
     """Try PubMed Central for a free PDF via DOI-to-PMCID conversion."""
     try:
-        conv_resp = requests.get(
+        conv_resp = _safe_get(
             "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/",
             params={"ids": doi, "format": "json", "tool": "zotero-mcp",
                     "email": "zotero-mcp@users.noreply.github.com"},
@@ -386,7 +452,8 @@ def _try_pmc(doi, ctx):
         return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
 
     except Exception as e:
-        ctx.info(f"PMC lookup failed: {e}")
+        logger.debug("PMC lookup error: %s", e)
+        ctx.info("PMC lookup failed")
         return None
 
 
